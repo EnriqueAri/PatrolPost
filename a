@@ -1,0 +1,949 @@
+// Patrol Post - single-file app (everything lives in this one file)
+import React, { useReducer, useEffect, useState, useRef } from 'react';
+import {
+  SafeAreaView,
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  ScrollView,
+  StyleSheet,
+  KeyboardAvoidingView,
+  Platform,
+  Alert,
+} from 'react-native';
+import { StatusBar } from 'expo-status-bar';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+/* ================= DATA / STATE ================= */
+
+const KEY = 'patrol-post-v1';
+
+const COOK_ROLES = [
+  'Grubmaster',
+  'Head Cook',
+  'Assistant Cook',
+  'Fire / Stove Lead',
+  'Water & Dishes',
+  'Cleanup Crew',
+  'No role yet',
+];
+
+const RANKS = [
+  'Scout',
+  'Tenderfoot',
+  'Second Class',
+  'First Class',
+  'Star',
+  'Life',
+  'Eagle',
+];
+
+const uid = () =>
+  Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+const initialState = {
+  ready: false,
+  patrolName: '',
+  meId: null,
+  members: [], // { id, name, rank }
+  campouts: [], // { id, name, location, date, createdBy, rsvps: { [memberId]: Rsvp } }
+  // Rsvp: { status: 'going'|'maybe'|'no', cookRole, purpose, requirements: string[] }
+  messages: [], // { id, from, to, kind: 'message'|'signoff', text, requirement, status, ts, readBy: [] }
+};
+
+async function load() {
+  try {
+    const raw = await AsyncStorage.getItem(KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function save(state) {
+  try {
+    const { ready, ...rest } = state;
+    await AsyncStorage.setItem(KEY, JSON.stringify(rest));
+  } catch (e) {
+    // ignore storage errors
+  }
+}
+
+function reducer(state, action) {
+  switch (action.type) {
+    case 'HYDRATE':
+      return { ...state, ...action.data, ready: true };
+    case 'READY':
+      return { ...state, ready: true };
+
+    case 'SETUP': {
+      const me = { id: uid(), name: action.name.trim(), rank: action.rank };
+      return {
+        ...state,
+        patrolName: action.patrolName.trim(),
+        members: [me],
+        meId: me.id,
+      };
+    }
+
+    case 'ADD_MEMBER': {
+      const m = { id: uid(), name: action.name.trim(), rank: action.rank };
+      return { ...state, members: [...state.members, m] };
+    }
+
+    case 'SWITCH_USER':
+      return { ...state, meId: action.id };
+
+    case 'ADD_CAMPOUT': {
+      const c = {
+        id: uid(),
+        name: action.name.trim(),
+        location: action.location.trim(),
+        date: (action.date || '').trim(),
+        createdBy: state.meId,
+        rsvps: {},
+      };
+      return { ...state, campouts: [c, ...state.campouts] };
+    }
+
+    case 'DELETE_CAMPOUT':
+      return {
+        ...state,
+        campouts: state.campouts.filter((c) => c.id !== action.id),
+      };
+
+    case 'SET_RSVP':
+      return {
+        ...state,
+        campouts: state.campouts.map((c) =>
+          c.id === action.campoutId
+            ? {
+                ...c,
+                rsvps: {
+                  ...c.rsvps,
+                  [state.meId]: { ...c.rsvps[state.meId], ...action.rsvp },
+                },
+              }
+            : c
+        ),
+      };
+
+    case 'SEND_MESSAGE': {
+      const msg = {
+        id: uid(),
+        from: state.meId,
+        to: action.to,
+        kind: action.kind || 'message',
+        text: action.text || '',
+        requirement: action.requirement || '',
+        status: action.kind === 'signoff' ? 'pending' : null,
+        ts: Date.now(),
+        readBy: [state.meId],
+      };
+      return { ...state, messages: [...state.messages, msg] };
+    }
+
+    case 'SIGNOFF_RESPOND':
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === action.id ? { ...m, status: action.status } : m
+        ),
+      };
+
+    case 'MARK_READ':
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.to === state.meId &&
+          m.from === action.withId &&
+          !m.readBy.includes(state.meId)
+            ? { ...m, readBy: [...m.readBy, state.meId] }
+            : m
+        ),
+      };
+
+    default:
+      return state;
+  }
+}
+
+/* ================= UI ================= */
+
+const C = {
+  green: '#2f5d3a',
+  greenDark: '#1f4128',
+  khaki: '#f3ecd9',
+  card: '#ffffff',
+  ink: '#222222',
+  muted: '#6b6b6b',
+  line: '#e2dcc8',
+  yes: '#2e7d32',
+  maybe: '#b7791f',
+  no: '#b23b3b',
+  accent: '#c8892b',
+};
+
+/* ---------- small shared pieces ---------- */
+
+const Btn = ({ title, onPress, kind = 'primary', disabled, style }) => (
+  <TouchableOpacity
+    onPress={onPress}
+    disabled={disabled}
+    style={[
+      s.btn,
+      kind === 'secondary' && s.btnSecondary,
+      kind === 'danger' && s.btnDanger,
+      disabled && { opacity: 0.4 },
+      style,
+    ]}
+  >
+    <Text style={[s.btnText, kind === 'secondary' && { color: C.green }]}>
+      {title}
+    </Text>
+  </TouchableOpacity>
+);
+
+const Chip = ({ label, selected, onPress, color }) => (
+  <TouchableOpacity
+    onPress={onPress}
+    style={[
+      s.chip,
+      selected && { backgroundColor: color || C.green, borderColor: color || C.green },
+    ]}
+  >
+    <Text style={[s.chipText, selected && { color: '#fff' }]}>{label}</Text>
+  </TouchableOpacity>
+);
+
+const Field = ({ label, ...props }) => (
+  <View style={{ marginBottom: 12 }}>
+    {label ? <Text style={s.label}>{label}</Text> : null}
+    <TextInput
+      placeholderTextColor="#9a9a9a"
+      style={s.input}
+      {...props}
+    />
+  </View>
+);
+
+const Header = ({ title, onBack, right }) => (
+  <View style={s.header}>
+    {onBack ? (
+      <TouchableOpacity onPress={onBack} style={{ paddingRight: 12 }}>
+        <Text style={s.headerBack}>‹ Back</Text>
+      </TouchableOpacity>
+    ) : null}
+    <Text style={s.headerTitle} numberOfLines={1}>
+      {title}
+    </Text>
+    <View style={{ flex: 1 }} />
+    {right}
+  </View>
+);
+
+const statusColor = (st) =>
+  st === 'going' ? C.yes : st === 'maybe' ? C.maybe : st === 'no' ? C.no : C.muted;
+const statusLabel = (st) =>
+  st === 'going' ? 'Going' : st === 'maybe' ? 'Maybe' : st === 'no' ? "Can't go" : 'No reply';
+
+/* ---------- first-run setup ---------- */
+
+function Setup({ dispatch }) {
+  const [patrolName, setPatrolName] = useState('');
+  const [name, setName] = useState('');
+  const [rank, setRank] = useState('Scout');
+  const ok = patrolName.trim() && name.trim();
+  return (
+    <ScrollView contentContainerStyle={{ padding: 20 }}>
+      <Text style={s.logo}>⚜ Patrol Post</Text>
+      <Text style={s.tagline}>Campouts, roles, and sign-offs for your patrol.</Text>
+      <Field label="Patrol name" placeholder="e.g. Eagle Patrol" value={patrolName} onChangeText={setPatrolName} />
+      <Field label="Your name" placeholder="e.g. Alex" value={name} onChangeText={setName} />
+      <Text style={s.label}>Your current rank</Text>
+      <View style={s.wrap}>
+        {RANKS.map((r) => (
+          <Chip key={r} label={r} selected={rank === r} onPress={() => setRank(r)} />
+        ))}
+      </View>
+      <Btn
+        title="Create patrol"
+        disabled={!ok}
+        onPress={() => dispatch({ type: 'SETUP', patrolName, name, rank })}
+        style={{ marginTop: 20 }}
+      />
+    </ScrollView>
+  );
+}
+
+/* ---------- campouts ---------- */
+
+function CampoutsScreen({ state, dispatch, openCampout }) {
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState('');
+  const [location, setLocation] = useState('');
+  const [date, setDate] = useState('');
+
+  if (creating) {
+    const ok = name.trim() && location.trim();
+    return (
+      <View style={{ flex: 1 }}>
+        <Header title="New campout" onBack={() => setCreating(false)} />
+        <ScrollView contentContainerStyle={{ padding: 16 }}>
+          <Field label="Campout name" placeholder="e.g. Fall Backpacking Trip" value={name} onChangeText={setName} />
+          <Field label="Location" placeholder="e.g. Camp Tamarancho" value={location} onChangeText={setLocation} />
+          <Field label="Dates (optional)" placeholder="e.g. Dec 5–7" value={date} onChangeText={setDate} />
+          <Btn
+            title="Add campout"
+            disabled={!ok}
+            onPress={() => {
+              dispatch({ type: 'ADD_CAMPOUT', name, location, date });
+              setName('');
+              setLocation('');
+              setDate('');
+              setCreating(false);
+            }}
+          />
+        </ScrollView>
+      </View>
+    );
+  }
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Header
+        title="Campouts"
+        right={<Btn title="+ New" onPress={() => setCreating(true)} style={s.smallBtn} />}
+      />
+      <FlatList
+        data={state.campouts}
+        keyExtractor={(c) => c.id}
+        contentContainerStyle={{ padding: 16 }}
+        ListEmptyComponent={
+          <Text style={s.empty}>No campouts yet. Tap “+ New” to add your first one.</Text>
+        }
+        renderItem={({ item }) => {
+          const vals = Object.values(item.rsvps);
+          const going = vals.filter((r) => r.status === 'going').length;
+          const maybe = vals.filter((r) => r.status === 'maybe').length;
+          const mine = item.rsvps[state.meId];
+          return (
+            <TouchableOpacity style={s.card} onPress={() => openCampout(item.id)}>
+              <Text style={s.cardTitle}>{item.name}</Text>
+              <Text style={s.cardSub}>📍 {item.location}{item.date ? `  ·  ${item.date}` : ''}</Text>
+              <View style={[s.row, { marginTop: 8 }]}>
+                <Text style={[s.pill, { color: C.yes }]}>{going} going</Text>
+                <Text style={[s.pill, { color: C.maybe }]}>{maybe} maybe</Text>
+                <View style={{ flex: 1 }} />
+                <Text style={{ color: statusColor(mine?.status), fontWeight: '600' }}>
+                  You: {statusLabel(mine?.status)}
+                </Text>
+              </View>
+            </TouchableOpacity>
+          );
+        }}
+      />
+    </View>
+  );
+}
+
+function RsvpEditor({ campout, state, dispatch }) {
+  const mine = campout.rsvps[state.meId] || {};
+  const [purpose, setPurpose] = useState(mine.purpose || '');
+  const [reqText, setReqText] = useState('');
+  const reqs = mine.requirements || [];
+
+  const update = (rsvp) =>
+    dispatch({ type: 'SET_RSVP', campoutId: campout.id, rsvp });
+
+  const addReq = () => {
+    const t = reqText.trim();
+    if (!t) return;
+    update({ requirements: [...reqs, t] });
+    setReqText('');
+  };
+
+  return (
+    <View style={s.card}>
+      <Text style={s.cardTitle}>Your plan</Text>
+
+      <Text style={s.label}>Are you coming?</Text>
+      <View style={s.wrap}>
+        <Chip label="Going" selected={mine.status === 'going'} color={C.yes} onPress={() => update({ status: 'going' })} />
+        <Chip label="Maybe" selected={mine.status === 'maybe'} color={C.maybe} onPress={() => update({ status: 'maybe' })} />
+        <Chip label="Can't go" selected={mine.status === 'no'} color={C.no} onPress={() => update({ status: 'no' })} />
+      </View>
+
+      {mine.status && mine.status !== 'no' ? (
+        <>
+          <Text style={s.label}>Cooking role</Text>
+          <View style={s.wrap}>
+            {COOK_ROLES.map((r) => (
+              <Chip key={r} label={r} selected={mine.cookRole === r} onPress={() => update({ cookRole: r })} />
+            ))}
+          </View>
+
+          <Text style={s.label}>What are you going to camp for?</Text>
+          <TextInput
+            style={s.input}
+            placeholder="e.g. Finish my fire-building and hiking requirements"
+            placeholderTextColor="#9a9a9a"
+            value={purpose}
+            onChangeText={setPurpose}
+            onEndEditing={() => update({ purpose })}
+            onBlur={() => update({ purpose })}
+            multiline
+          />
+
+          <Text style={[s.label, { marginTop: 12 }]}>Rank requirements you need from this camp</Text>
+          <View style={s.wrap}>
+            {reqs.map((r, i) => (
+              <Chip
+                key={r + i}
+                label={`${r}  ✕`}
+                selected
+                color={C.accent}
+                onPress={() => update({ requirements: reqs.filter((_, j) => j !== i) })}
+              />
+            ))}
+          </View>
+          <View style={s.row}>
+            <TextInput
+              style={[s.input, { flex: 1 }]}
+              placeholder="e.g. Second Class 2a – cook a meal"
+              placeholderTextColor="#9a9a9a"
+              value={reqText}
+              onChangeText={setReqText}
+              onSubmitEditing={addReq}
+            />
+            <Btn title="Add" onPress={addReq} style={[s.smallBtn, { marginLeft: 8 }]} />
+          </View>
+        </>
+      ) : null}
+    </View>
+  );
+}
+
+function CampoutDetail({ state, dispatch, campoutId, onBack, openChat }) {
+  const campout = state.campouts.find((c) => c.id === campoutId);
+  if (!campout) return null;
+
+  const confirmDelete = () =>
+    Alert.alert('Delete campout?', 'This removes it for your patrol.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          dispatch({ type: 'DELETE_CAMPOUT', id: campout.id });
+          onBack();
+        },
+      },
+    ]);
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Header title={campout.name} onBack={onBack} />
+      <ScrollView contentContainerStyle={{ padding: 16 }}>
+        <View style={s.card}>
+          <Text style={s.cardSub}>📍 {campout.location}</Text>
+          {campout.date ? <Text style={s.cardSub}>🗓 {campout.date}</Text> : null}
+        </View>
+
+        <RsvpEditor campout={campout} state={state} dispatch={dispatch} />
+
+        <Text style={s.sectionTitle}>Patrol roster</Text>
+        {state.members.map((m) => {
+          const r = campout.rsvps[m.id];
+          const isMe = m.id === state.meId;
+          return (
+            <View key={m.id} style={s.card}>
+              <View style={s.row}>
+                <Text style={s.cardTitle}>{m.name}{isMe ? ' (you)' : ''}</Text>
+                <View style={{ flex: 1 }} />
+                <Text style={{ color: statusColor(r?.status), fontWeight: '700' }}>
+                  {statusLabel(r?.status)}
+                </Text>
+              </View>
+              <Text style={s.cardSub}>{m.rank}</Text>
+              {r?.cookRole ? <Text style={s.detail}>🍳 {r.cookRole}</Text> : null}
+              {r?.purpose ? <Text style={s.detail}>🎯 {r.purpose}</Text> : null}
+              {r?.requirements?.length ? (
+                <View style={[s.wrap, { marginTop: 6 }]}>
+                  {r.requirements.map((q, i) => (
+                    <Text key={q + i} style={s.reqTag}>{q}</Text>
+                  ))}
+                </View>
+              ) : null}
+              {!isMe ? (
+                <Btn
+                  title={`Message ${m.name}`}
+                  kind="secondary"
+                  onPress={() => openChat(m.id)}
+                  style={{ marginTop: 10 }}
+                />
+              ) : null}
+            </View>
+          );
+        })}
+
+        {campout.createdBy === state.meId ? (
+          <Btn title="Delete campout" kind="danger" onPress={confirmDelete} style={{ marginTop: 8 }} />
+        ) : null}
+      </ScrollView>
+    </View>
+  );
+}
+
+/* ---------- messages ---------- */
+
+const threadWith = (state, otherId) =>
+  state.messages
+    .filter(
+      (m) =>
+        (m.from === state.meId && m.to === otherId) ||
+        (m.from === otherId && m.to === state.meId)
+    )
+    .sort((a, b) => a.ts - b.ts);
+
+function MessagesScreen({ state, openChat }) {
+  const others = state.members.filter((m) => m.id !== state.meId);
+  const rows = others
+    .map((m) => {
+      const t = threadWith(state, m.id);
+      const unread = t.filter((x) => x.to === state.meId && !x.readBy.includes(state.meId)).length;
+      const pending = t.filter((x) => x.kind === 'signoff' && x.status === 'pending' && x.to === state.meId).length;
+      return { m, last: t[t.length - 1], unread, pending };
+    })
+    .sort((a, b) => (b.last?.ts || 0) - (a.last?.ts || 0));
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Header title="Messages" />
+      <FlatList
+        data={rows}
+        keyExtractor={(r) => r.m.id}
+        contentContainerStyle={{ padding: 16 }}
+        ListEmptyComponent={
+          <Text style={s.empty}>Add patrol mates in the Patrol tab to start messaging.</Text>
+        }
+        renderItem={({ item }) => (
+          <TouchableOpacity style={s.card} onPress={() => openChat(item.m.id)}>
+            <View style={s.row}>
+              <Text style={s.cardTitle}>{item.m.name}</Text>
+              <View style={{ flex: 1 }} />
+              {item.pending ? <Text style={s.badgeWarn}>{item.pending} sign-off</Text> : null}
+              {item.unread ? <Text style={s.badge}>{item.unread}</Text> : null}
+            </View>
+            <Text style={s.cardSub} numberOfLines={1}>
+              {item.last
+                ? item.last.kind === 'signoff'
+                  ? `✍ Sign-off: ${item.last.requirement}`
+                  : item.last.text
+                : 'No messages yet'}
+            </Text>
+          </TouchableOpacity>
+        )}
+      />
+    </View>
+  );
+}
+
+function ChatScreen({ state, dispatch, otherId, onBack }) {
+  const other = state.members.find((m) => m.id === otherId);
+  const [text, setText] = useState('');
+  const [asking, setAsking] = useState(false);
+  const [req, setReq] = useState('');
+  const [note, setNote] = useState('');
+  const listRef = useRef(null);
+  const thread = threadWith(state, otherId);
+
+  useEffect(() => {
+    dispatch({ type: 'MARK_READ', withId: otherId });
+  }, [thread.length]);
+
+  useEffect(() => {
+    setTimeout(() => listRef.current?.scrollToEnd?.({ animated: true }), 50);
+  }, [thread.length]);
+
+  if (!other) return null;
+
+  const send = () => {
+    if (!text.trim()) return;
+    dispatch({ type: 'SEND_MESSAGE', to: otherId, kind: 'message', text: text.trim() });
+    setText('');
+  };
+
+  const sendSignoff = () => {
+    if (!req.trim()) return;
+    dispatch({
+      type: 'SEND_MESSAGE',
+      to: otherId,
+      kind: 'signoff',
+      requirement: req.trim(),
+      text: note.trim(),
+    });
+    setReq('');
+    setNote('');
+    setAsking(false);
+  };
+
+  return (
+    <KeyboardAvoidingView
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
+      <Header title={other.name} onBack={onBack} />
+      <FlatList
+        ref={listRef}
+        data={thread}
+        keyExtractor={(m) => m.id}
+        contentContainerStyle={{ padding: 12 }}
+        ListEmptyComponent={<Text style={s.empty}>Say hi, or request a sign-off.</Text>}
+        renderItem={({ item }) => {
+          const mine = item.from === state.meId;
+          if (item.kind === 'signoff') {
+            const canRespond = !mine && item.status === 'pending';
+            return (
+              <View style={[s.bubble, s.signoff, mine ? s.bubbleMine : s.bubbleTheirs]}>
+                <Text style={s.signoffHead}>
+                  ✍ Sign-off request{mine ? ' (sent)' : ''}
+                </Text>
+                <Text style={{ fontWeight: '700', marginTop: 2 }}>{item.requirement}</Text>
+                {item.text ? <Text style={{ marginTop: 2 }}>{item.text}</Text> : null}
+                <Text
+                  style={{
+                    marginTop: 6,
+                    fontWeight: '700',
+                    color:
+                      item.status === 'approved' ? C.yes : item.status === 'declined' ? C.no : C.maybe,
+                  }}
+                >
+                  {item.status === 'approved'
+                    ? '✔ Approved'
+                    : item.status === 'declined'
+                    ? '✖ Not yet'
+                    : 'Pending'}
+                </Text>
+                {canRespond ? (
+                  <View style={[s.row, { marginTop: 8 }]}>
+                    <Btn
+                      title="Approve"
+                      onPress={() => dispatch({ type: 'SIGNOFF_RESPOND', id: item.id, status: 'approved' })}
+                      style={[s.smallBtn, { marginRight: 8 }]}
+                    />
+                    <Btn
+                      title="Not yet"
+                      kind="secondary"
+                      onPress={() => dispatch({ type: 'SIGNOFF_RESPOND', id: item.id, status: 'declined' })}
+                      style={s.smallBtn}
+                    />
+                  </View>
+                ) : null}
+              </View>
+            );
+          }
+          return (
+            <View style={[s.bubble, mine ? s.bubbleMine : s.bubbleTheirs]}>
+              <Text style={{ color: mine ? '#fff' : C.ink }}>{item.text}</Text>
+            </View>
+          );
+        }}
+      />
+
+      {asking ? (
+        <View style={s.composerBox}>
+          <Text style={s.label}>Requirement to get signed off</Text>
+          <TextInput
+            style={s.input}
+            placeholder="e.g. First Class 3b – lash a tripod"
+            placeholderTextColor="#9a9a9a"
+            value={req}
+            onChangeText={setReq}
+          />
+          <TextInput
+            style={[s.input, { marginTop: 8 }]}
+            placeholder="Note (optional)"
+            placeholderTextColor="#9a9a9a"
+            value={note}
+            onChangeText={setNote}
+          />
+          <View style={[s.row, { marginTop: 8 }]}>
+            <Btn title="Send request" onPress={sendSignoff} disabled={!req.trim()} style={[s.smallBtn, { marginRight: 8 }]} />
+            <Btn title="Cancel" kind="secondary" onPress={() => setAsking(false)} style={s.smallBtn} />
+          </View>
+        </View>
+      ) : (
+        <View style={s.composer}>
+          <TouchableOpacity onPress={() => setAsking(true)} style={s.signoffBtn}>
+            <Text style={{ fontSize: 18 }}>✍</Text>
+          </TouchableOpacity>
+          <TextInput
+            style={[s.input, { flex: 1 }]}
+            placeholder="Message"
+            placeholderTextColor="#9a9a9a"
+            value={text}
+            onChangeText={setText}
+            onSubmitEditing={send}
+          />
+          <Btn title="Send" onPress={send} disabled={!text.trim()} style={[s.smallBtn, { marginLeft: 8 }]} />
+        </View>
+      )}
+    </KeyboardAvoidingView>
+  );
+}
+
+/* ---------- patrol ---------- */
+
+function PatrolScreen({ state, dispatch }) {
+  const [name, setName] = useState('');
+  const [rank, setRank] = useState('Scout');
+  const me = state.members.find((m) => m.id === state.meId);
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Header title={state.patrolName || 'Patrol'} />
+      <ScrollView contentContainerStyle={{ padding: 16 }}>
+        <Text style={s.sectionTitle}>Members</Text>
+        {state.members.map((m) => (
+          <View key={m.id} style={s.card}>
+            <View style={s.row}>
+              <View>
+                <Text style={s.cardTitle}>{m.name}{m.id === state.meId ? ' (you)' : ''}</Text>
+                <Text style={s.cardSub}>{m.rank}</Text>
+              </View>
+              <View style={{ flex: 1 }} />
+              {m.id !== state.meId ? (
+                <Btn
+                  title="Act as"
+                  kind="secondary"
+                  onPress={() => dispatch({ type: 'SWITCH_USER', id: m.id })}
+                  style={s.smallBtn}
+                />
+              ) : null}
+            </View>
+          </View>
+        ))}
+
+        <Text style={s.sectionTitle}>Add a patrol mate</Text>
+        <View style={s.card}>
+          <Field label="Name" placeholder="e.g. Jordan" value={name} onChangeText={setName} />
+          <Text style={s.label}>Rank</Text>
+          <View style={s.wrap}>
+            {RANKS.map((r) => (
+              <Chip key={r} label={r} selected={rank === r} onPress={() => setRank(r)} />
+            ))}
+          </View>
+          <Btn
+            title="Add to patrol"
+            disabled={!name.trim()}
+            onPress={() => {
+              dispatch({ type: 'ADD_MEMBER', name, rank });
+              setName('');
+            }}
+            style={{ marginTop: 14 }}
+          />
+        </View>
+
+        <Text style={s.note}>
+          You are signed in as {me?.name}. “Act as” lets you try the app from another
+          patrol mate’s point of view on this phone. Syncing between separate phones
+          needs a shared online database (see README).
+        </Text>
+      </ScrollView>
+    </View>
+  );
+}
+
+/* ---------- root ---------- */
+
+export default function App() {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const [tab, setTab] = useState('campouts');
+  const [campoutId, setCampoutId] = useState(null);
+  const [chatWith, setChatWith] = useState(null);
+
+  useEffect(() => {
+    load().then((data) =>
+      data ? dispatch({ type: 'HYDRATE', data }) : dispatch({ type: 'READY' })
+    );
+  }, []);
+
+  useEffect(() => {
+    if (state.ready) save(state);
+  }, [state]);
+
+  const unreadTotal = state.messages.filter(
+    (m) => m.to === state.meId && !m.readBy.includes(state.meId)
+  ).length;
+
+  let body;
+  if (!state.ready) {
+    body = <View />;
+  } else if (!state.meId) {
+    body = <Setup dispatch={dispatch} />;
+  } else if (chatWith) {
+    body = (
+      <ChatScreen
+        state={state}
+        dispatch={dispatch}
+        otherId={chatWith}
+        onBack={() => setChatWith(null)}
+      />
+    );
+  } else if (campoutId) {
+    body = (
+      <CampoutDetail
+        state={state}
+        dispatch={dispatch}
+        campoutId={campoutId}
+        onBack={() => setCampoutId(null)}
+        openChat={(id) => {
+          setCampoutId(null);
+          setTab('messages');
+          setChatWith(id);
+        }}
+      />
+    );
+  } else if (tab === 'campouts') {
+    body = <CampoutsScreen state={state} dispatch={dispatch} openCampout={setCampoutId} />;
+  } else if (tab === 'messages') {
+    body = <MessagesScreen state={state} openChat={setChatWith} />;
+  } else {
+    body = <PatrolScreen state={state} dispatch={dispatch} />;
+  }
+
+  const showTabs = state.ready && state.meId && !chatWith && !campoutId;
+
+  return (
+    <SafeAreaView style={s.root}>
+      <StatusBar style="light" />
+      <View style={s.topBar}>
+        <Text style={s.topBarText}>⚜ Patrol Post</Text>
+      </View>
+      <View style={{ flex: 1, backgroundColor: C.khaki }}>{body}</View>
+      {showTabs ? (
+        <View style={s.tabs}>
+          {[
+            ['campouts', '⛺ Campouts'],
+            ['messages', `✉ Messages${unreadTotal ? ` (${unreadTotal})` : ''}`],
+            ['patrol', '👥 Patrol'],
+          ].map(([key, label]) => (
+            <TouchableOpacity key={key} style={s.tab} onPress={() => setTab(key)}>
+              <Text style={[s.tabText, tab === key && s.tabTextActive]}>{label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      ) : null}
+    </SafeAreaView>
+  );
+}
+
+/* ---------- styles ---------- */
+
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: C.green },
+  topBar: { backgroundColor: C.green, paddingVertical: 10, paddingHorizontal: 16 },
+  topBarText: { color: '#fff', fontSize: 18, fontWeight: '800', letterSpacing: 0.5 },
+
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: C.khaki,
+    borderBottomWidth: 1,
+    borderBottomColor: C.line,
+  },
+  headerTitle: { fontSize: 20, fontWeight: '800', color: C.greenDark, flexShrink: 1 },
+  headerBack: { color: C.green, fontSize: 16, fontWeight: '700' },
+
+  logo: { fontSize: 32, fontWeight: '900', color: C.greenDark, marginTop: 20 },
+  tagline: { color: C.muted, marginBottom: 24, marginTop: 4 },
+
+  card: {
+    backgroundColor: C.card,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: C.line,
+  },
+  cardTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
+  cardSub: { color: C.muted, marginTop: 2 },
+  detail: { marginTop: 4, color: C.ink },
+  sectionTitle: { fontSize: 15, fontWeight: '800', color: C.greenDark, marginTop: 8, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 },
+  empty: { textAlign: 'center', color: C.muted, marginTop: 40 },
+  note: { color: C.muted, fontSize: 12, marginTop: 8, lineHeight: 18 },
+
+  row: { flexDirection: 'row', alignItems: 'center' },
+  wrap: { flexDirection: 'row', flexWrap: 'wrap' },
+  pill: { fontWeight: '700', marginRight: 12 },
+  reqTag: {
+    backgroundColor: '#fbefd5',
+    color: '#7a5311',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginRight: 6,
+    marginBottom: 6,
+    overflow: 'hidden',
+    fontSize: 12,
+  },
+
+  label: { fontWeight: '700', color: C.greenDark, marginBottom: 6, marginTop: 4 },
+  input: {
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: Platform.OS === 'ios' ? 10 : 8,
+    fontSize: 15,
+    color: C.ink,
+  },
+
+  btn: {
+    backgroundColor: C.green,
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  btnSecondary: { backgroundColor: '#fff', borderWidth: 1, borderColor: C.green },
+  btnDanger: { backgroundColor: C.no },
+  btnText: { color: '#fff', fontWeight: '700' },
+  smallBtn: { paddingVertical: 8, paddingHorizontal: 12 },
+
+  chip: {
+    borderWidth: 1,
+    borderColor: C.line,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  chipText: { color: C.ink, fontSize: 13, fontWeight: '600' },
+
+  badge: { backgroundColor: C.accent, color: '#fff', fontWeight: '800', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 2, overflow: 'hidden', marginLeft: 6 },
+  badgeWarn: { backgroundColor: C.maybe, color: '#fff', fontWeight: '800', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 2, overflow: 'hidden' },
+
+  bubble: { maxWidth: '80%', padding: 10, borderRadius: 14, marginBottom: 8 },
+  bubbleMine: { alignSelf: 'flex-end', backgroundColor: C.green },
+  bubbleTheirs: { alignSelf: 'flex-start', backgroundColor: '#fff', borderWidth: 1, borderColor: C.line },
+  signoff: { backgroundColor: '#fff8e6', borderColor: C.accent, borderWidth: 1, maxWidth: '88%' },
+  signoffHead: { fontWeight: '800', color: '#7a5311' },
+
+  composer: { flexDirection: 'row', alignItems: 'center', padding: 10, backgroundColor: C.khaki, borderTopWidth: 1, borderTopColor: C.line },
+  composerBox: { padding: 12, backgroundColor: C.khaki, borderTopWidth: 1, borderTopColor: C.line },
+  signoffBtn: { padding: 8, marginRight: 6 },
+
+  tabs: { flexDirection: 'row', backgroundColor: '#fff', borderTopWidth: 1, borderTopColor: C.line },
+  tab: { flex: 1, paddingVertical: 14, alignItems: 'center' },
+  tabText: { color: C.muted, fontWeight: '600', fontSize: 13 },
+  tabTextActive: { color: C.green, fontWeight: '800' },
+});
